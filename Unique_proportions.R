@@ -1,4 +1,4 @@
-setwd('/projectnb/bf528/students/jawa/bf528-individual-project-jawa23bio/')
+setwd('/projectnb/bf528/students/neharao/atacseq')
 
 # Load required libraries
 library(ggplot2)
