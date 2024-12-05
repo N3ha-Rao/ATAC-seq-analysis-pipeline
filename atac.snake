@@ -1,0 +1,373 @@
+REP = ['rep3', 'rep4']
+READ = ['R1', 'R2']
+EXTENSIONS = [1, 2, 3, 4, 'rev.1', 'rev.2']
+
+rule all:
+	input:
+		expand('results/ATAC{rep}_{read}_fastqc.html', rep = REP, read = READ),
+		expand('results/ATAC_{rep}_sorted_idxstats.txt', rep = REP),
+		expand('results/ATAC_{rep}_sorted_flagstat.txt', rep = REP),
+		expand('results/ATAC_{rep}_sorted.rmchrM.bam.bai', rep = REP),
+		expand('results/ATAC_{rep}_nbr.bw',rep = REP),
+		expand('results/ATAC_{rep}_nfr.bw', rep = REP),
+		'results/ATAC_annotated.txt',
+		expand('results/ATAC_{rep}_shifted_sorted.bam.bai', rep = REP),
+		directory('results/enrichment'),
+		directory('results/meme_out/'),
+
+rule fastqc:
+	input: 
+		fastq = 'samples/ATAC{rep}_{read}.fastq.gz'
+	output:
+		fastqc = 'results/ATAC{rep}_{read}_fastqc.html'
+	params:
+		outdir = 'results/'
+	threads: 4
+	conda:
+		'envs/fastqc_env.yml'
+	shell:
+		'''
+		fastqc {input.fastq} -o {params.outdir}
+		'''
+
+rule trimomatic:
+	input:
+		r1 = 'samples/ATAC{rep}_R1.fastq.gz',
+		r2 = 'samples/ATAC{rep}_R2.fastq.gz',
+		adapters = 'samples/NexteraPE-PE.fa'
+	output:
+		p1 = 'results/ATAC{rep}_R1_P.fq.gz',
+		u1 = 'results/ATAC{rep}_R1_U.fq.gz',
+		p2 = 'results/ATAC{rep}_R2_P.fq.gz',
+		u2 = 'results/ATAC{rep}_R2_U.fq.gz'
+	threads: 8
+	conda:
+		'envs/trimmomatic_env.yml'
+	shell:
+		'''
+		trimmomatic PE -threads {threads} \
+        {input.r1} {input.r2} \
+        {output.p1} {output.u1} {output.p2} {output.u2} \
+        ILLUMINACLIP:{input.adapters}:2:30:10 \
+        LEADING:3 \
+        TRAILING:3 \
+        SLIDINGWINDOW:4:15
+		'''
+
+rule wget_unzip:
+	output:
+		'samples/GRCh38.primary_assembly.genome.fa'
+	params: 
+		'samples/GRCh38.primary_assembly.genome.fa.gz'
+	shell:
+		'''
+		wget -P ./samples https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/GRCh38.primary_assembly.genome.fa.gz
+		gunzip {params}
+		'''
+
+rule bowtie2_build_gencode:
+	input:
+		fasta = 'samples/GRCh38.primary_assembly.genome.fa'
+	output:
+		expand('results/index/GRCh38.{ext}.bt2', ext = EXTENSIONS)
+	params:
+		outdir = 'results/index/GRCh38'
+	threads: 16
+	conda:
+		'envs/bowtie2_env.yml'
+	shell:
+		'''
+		mkdir -p results/index
+		bowtie2-build {input.fasta} {params.outdir}
+		'''
+
+rule unzip_trimmed_samples:
+	input: 
+		P = 'results/ATAC{rep}_{read}_P.fq.gz',
+		U = 'results/ATAC{rep}_{read}_U.fq.gz'
+	output:
+		P = 'results/trimmed/ATAC{rep}_{read}_P.fq',
+		U = 'results/trimmed/ATAC{rep}_{read}_U.fq'
+	shell:
+		'''
+		mkdir -p results/trimmed
+		gunzip -c {input.P} > {output.P}
+		gunzip -c {input.U} > {output.U}
+		'''
+
+rule bowtie2_align:
+	input:
+		R1P = 'results/trimmed/ATAC{rep}_R1_P.fq',
+		R1U = 'results/trimmed/ATAC{rep}_R1_U.fq',
+		R2P = 'results/trimmed/ATAC{rep}_R2_P.fq',
+		R2U = 'results/trimmed/ATAC{rep}_R2_U.fq'
+	output:
+		'results/ATAC_{rep}.bam'
+	threads: 28
+	params:
+		index = 'results/index/GRCh38'
+	conda:
+		'envs/bowtie2_env.yml'
+	shell:
+		'''
+		bowtie2 -x {params.index} -1 {input.R1P} -2 {input.R2P} -U {input.R1U} {input.R2U} -X 2000 | samtools view -bS - > {output}
+		'''
+
+rule samtools_sort:
+	input:
+		bam = 'results/ATAC_{rep}.bam'
+	output:
+		sorted = 'results/ATAC_{rep}.sorted.bam'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools sort -o {output.sorted} {input.bam} 
+		'''
+
+rule samtools_idxstats:
+	input:
+		sorted = 'results/ATAC_{rep}.sorted.bam'
+	output:
+		stats = 'results/ATAC_{rep}_sorted_idxstats.txt'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools idxstats {input.sorted} > {output.stats} 
+		'''
+
+rule samtools_flagstats:
+	input:
+		bam = 'results/ATAC_{rep}.sorted.bam'
+	output:
+		flagstat = 'results/ATAC_{rep}_sorted_flagstat.txt'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		''' 
+		samtools flagstat {input.bam} > {output.flagstat}
+		'''
+
+# Check for 'chrM' entries in the idxstats file. If you have reads for chrM, remove them using the following rule 
+rule rm_chrM:
+	input:
+		'results/ATAC_{rep}.sorted.bam'
+	output:
+		'results/ATAC_{rep}_sorted.rmchrM.bam'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools view -h {input} | grep -v chrM | samtools sort -O bam -o {output}
+		'''
+
+rule samtools_idx:
+	input:
+		sorted = 'results/ATAC_{rep}_sorted.rmchrM.bam'
+	output:
+		index = 'results/ATAC_{rep}_sorted.rmchrM.bam.bai'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools index {input.sorted} {output.index} 
+		'''
+
+rule shiftreads:
+	input:
+		'results/ATAC_{rep}_sorted.rmchrM.bam'
+	output:
+		'results/ATAC_{rep}.shifted.bam',
+	conda:
+		'envs/deeptools_env.yml'
+	threads: 16
+	shell:
+		'''
+		alignmentSieve -p {threads} --ATACshift -b {input} -o {output}
+		'''
+
+rule samtools_shifted_sort:
+	input:
+		bam = 'results/ATAC_{rep}.shifted.bam'
+	output:
+		sorted = 'results/ATAC_{rep}_shifted_sorted.bam'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools sort -o {output.sorted} {input.bam} 
+		'''
+
+rule samtools_shifted_idx:
+	input:
+		sorted = 'results/ATAC_{rep}_shifted_sorted.bam'
+	output:
+		index = 'results/ATAC_{rep}_shifted_sorted.bam.bai'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools index {input.sorted} {output.index} 
+		'''
+
+# Perform atacseqqc using the `atacseqqc.R` script
+
+rule bamCoverage:
+	input:
+		bam = 'results/ATAC_{rep}_shifted_sorted.bam'
+	output:
+		nfr_bw = 'results/ATAC_{rep}_nfr.bw',
+		nbr_bw = 'results/ATAC_{rep}_nbr.bw'
+	threads: 16
+	conda:
+		'envs/deeptools_env.yml'
+	params:
+		nfr = 99,
+		nbr = 100
+	shell:
+		'''
+		bamCoverage -b {input.bam} --maxFragmentLength {params.nfr} -o {output.nfr_bw} 
+		bamCoverage -b {input.bam} --minFragmentLength {params.nbr} -o {output.nbr_bw} 
+		'''
+
+rule call_peak:
+	input:
+		'results/ATAC_{rep}_shifted_sorted.bam'
+	output:
+		'results/macs3_peaks/ATAC_{rep}_peaks.narrowPeak'
+	conda:
+		'envs/macs3.yml'
+	threads: 16
+	params:
+		'results/macs3_peaks'
+	shell:
+		'''
+		macs3 callpeak -t {input} -n ATAC_{wildcards.rep} -f BAMPE --outdir {params} --nomodel --shift -37 --extsize 73 --keep-dup all --cutoff-analysis
+		'''
+
+rule intersect_peaks:
+	input:
+		peak1 = 'results/macs3_peaks/ATAC_rep3_peaks.narrowPeak',
+		peak2 = 'results/macs3_peaks/ATAC_rep4_peaks.narrowPeak'
+	output:
+		'results/ATAC_intersect.narrowPeak'
+	conda:
+		'envs/bedtools_env.yml'
+	shell:
+		'''
+		bedtools intersect -a {input.peak1} -b {input.peak2} > {output}
+		'''
+
+rule filter_blacklist:
+	input:
+		intersect = 'results/ATAC_intersect.narrowPeak',
+		blacklist = 'samples/hg38-blacklist.v2.bed'
+	output:
+		'results/ATAC_filtered.narrowPeak'
+	conda:
+		'envs/bedtools_env.yml'
+	shell:
+		'''
+		bedtools intersect -v -a {input.intersect} -b {input.blacklist} > {output}
+		'''
+
+rule wget_unzip_gtf:
+	output:
+		'samples/gencode.v45.primary_assembly.annotation.gtf'
+	params: 
+		'samples/gencode.v45.primary_assembly.annotation.gtf.gz'
+	shell:
+		'''
+		wget -P ./samples https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/gencode.v45.primary_assembly.annotation.gtf.gz
+		gunzip {params}
+		'''
+
+# Before doing HOMER GO enrichment, check if the organism related files are present and updated.
+# If not, update using perl /path-to-homer/configureHomer.pl -install human
+
+rule annotate_peaks:
+	input:
+		bf = 'results/ATAC_filtered.narrowPeak',
+		gtf = 'samples/gencode.v45.primary_assembly.annotation.gtf'
+	output:
+		annotate = 'results/ATAC_annotated.txt',
+		enrichment = directory('results/enrichment')
+	conda:
+		'envs/homer_env.yml'
+	threads: 8
+	shell:
+		'''
+		annotatePeaks.pl {input.bf} hg38 -gtf {input.gtf} -go {output.enrichment} > {output.annotate}
+		'''
+
+rule meme_ref:
+	output:
+		'hg38_masked.fa'
+	params:
+		'samples/hg38.chromFaMasked.tar.gz'
+	shell:
+		'''
+		wget -P ./samples https://hgdownload.cse.ucsc.edu/goldenPath/hg38/bigZips/hg38.chromFaMasked.tar.gz
+		tar xvzf {params}
+		cat ./maskedChroms/* > {output}
+		'''
+
+rule top1000_centered_peaks:
+	input:
+		fil = 'results/ATAC_filtered.narrowPeak',
+		fa = 'hg38_masked.fa'
+	output:
+		centered = 'results/ATAC_centered.bed'
+	params:
+		sig = 'results/ATAC_sorted.narrowPeak',
+		sort = 'results/ATAC_sorted_1000.bed'
+	shell:
+		'''
+		sort -k9nr {input.fil} > {params.sig}
+		head -1000 {params.sig} > {params.sort}
+		awk 'BEGIN{{ OFS="\t";}}{{ midPos=$2+$10; print $1, midPos-350, midPos+350; }}' {params.sort} > {output.centered}
+		'''
+
+rule fastafrombed:
+	input:
+		bed = 'results/ATAC_centered.bed',
+		fa = 'hg38_masked.fa'
+	output:
+		'results/top1000_centered_seq.fa'
+	conda:
+		'envs/bedtools_env.yml'
+	threads: 8
+	shell:
+		'''
+		bedtools getfasta -fo {output} -fi {input.fa} -bed {input.bed}
+		'''
+
+rule bg_model:
+	input:
+		'results/top1000_centered_seq.fa'
+	output:
+		'results/meme_bg.model'
+	conda:
+		'envs/meme_env.yml'
+	threads: 4
+	shell:
+		'''
+		fasta-get-markov -m 2 -dna -nostatus -nosummary {input} {output}
+		'''
+
+rule meme_chip:
+	input:
+		fa = 'results/top1000_centered_seq.fa',
+		bg = 'results/meme_bg.model'
+	output:
+		directory('results/meme_out/')
+	conda:
+		'envs/meme_env.yml'
+	threads: 8
+	shell:
+		'''
+		wget -P ./samples https://meme-suite.org/meme/meme-software/Databases/motifs/motif_databases.12.24.tgz
+		tar -xvzf samples/motif_databases.12.24.tgz
+		meme-chip -oc {output} -dna -bfile {input.bg} -order 2 -meme-norand -meme-mod zoops -meme-nmotifs 10 -minw 6 -maxw 30 -meme-p {threads} -ccut 0 -db motif_databases/JASPAR/JASPAR2022_CORE_vertebrates_redundant_v2.meme -db motif_databases/JASPAR/JASPAR2022_CORE_vertebrates_non-redundant_v2.meme -db motif_databases/HUMAN/HOCOMOCOv11_core_HUMAN_mono_meme_format.meme {input.fa}
+		'''
